@@ -1,0 +1,142 @@
+stages:
+  - 🐳build
+  - 🚀play
+
+variables:
+  EE_IMAGES: $CI_REGISTRY_IMAGE/ee:latest
+  ANSIBLE_FORCE_COLOR: "1"
+  ANSIBLE_PYTHON_INTERPRETER: /usr/bin/python3
+  ANSIBLE_REMOTE_TMP: /tmp
+  ANSIBLE_STARATEGY: linear
+  ANSIBLE_PIPELINING: 1
+  ANSIBLE_TRANSPORT: ssh
+  ANSIBLE_BECOME_METHOD: su
+  ANSIBLE_BECOME_USER: root
+  ANSIBLE_BECOME_ASKPASS: 'False'
+  ANSIBLE_FORCE_HANDLER: 'True'
+  ANSIBLE_STDOUT_CALLBACK: yaml
+  ANSIBLE_ASK_PASS: 'False'
+  ANSIBLE_NOCOWS: 1
+  ANSIBLE_HOST_KEY_CHECKING: 'false'
+  ANSIBLE_BECOME_EXE: 'sudo -p "Password: " su -'
+  DEPRECATION_WARNINGS: 'False'
+  ANSIBLE_TIMEOUT: 30
+
+🐳build-ee:
+  stage: 🐳build
+  image: docker:24
+  services:
+    - name: docker:24-dind
+      alias: docker
+      command: ["--tls=false"]
+  variables:
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_DRIVER: overlay2
+  script:
+    - docker build -t $EE_IMAGES .
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_TOKEN $CI_REGISTRY
+    - docker push $EE_IMAGES
+  tags:
+    - Docker
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes:
+        - Dockerfile
+        - requirements.yml
+ 
+
+🚀generate_inventory_roles_and_play:
+  stage: 🚀play
+  image: $EE_IMAGES
+  variables:
+    SERVER_IPS: 46.229.212.164
+    SERVER_NAMES: 6090475-xl39660
+  tags:
+    - Docker
+  
+  script:
+    - rm .gitlab-ci.yml
+    - eval $(ssh-agent -s)
+    - echo "$SSH_ROOT_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - |
+      cat > hosts.yml << EOF
+      ---
+      all:
+        vars:
+          ansible_user: $SSH_USER
+      EOF
+
+      # Динамически добавляем серверы из переменных GitLab
+      SERVERS_JSON=$SERVERS  # Переменная должна содержать JSON массив серверов
+
+      if [ -n "$SERVERS_JSON" ] && [ "$SERVERS_JSON" != "null" ]; then
+        echo "  hosts:" >> hosts.yml
+
+        # Обрабатываем каждый сервер
+        jq -c '.[] | @base64' $SERVERS_JSON | while read -r encoded_server; do
+          server=$(echo "${encoded_server}" | base64 -d)
+          server_name=$(echo "$server" | jq -r ".name")
+          server_ip=$(echo "$server" | jq -r ".ip")
+
+          echo "    $server_name:" >> hosts.yml
+          echo "      ansible_host: $server_ip" >> hosts.yml
+
+        done
+      else
+        # Резервный вариант - статические серверы из переменных
+        echo "  hosts:" >> hosts.yml
+        IFS=',' read -ra SERVER_LIST <<< "$SERVER_IPS"
+        IFS=',' read -ra SERVER_NAMES <<< "$SERVER_NAMES"
+
+        for i in "${!SERVER_LIST[@]}"; do
+          server_ip="${SERVER_LIST[$i]}"
+          server_name="${SERVER_NAMES[$i]:-server$((i+1))}"
+          echo "    $server_name:" >> hosts.yml
+          echo "      ansible_host: $server_ip" >> hosts.yml
+        done
+      fi
+
+      echo "Generated hosts.yml:"
+      cat hosts.yml
+
+    
+    - |
+      if [ -f requirements1.yml ]; then
+        echo "Installing roles from requirements1.yml..."
+        ansible-galaxy install -r requirements1.yml --ignore-errors -p roles/ --force
+      else
+        echo "No requirements.yml found, creating example..."
+        cat > requirements1.yml << EOF
+        # roles from GitLab
+        - src: 'https://oauth2:${ANSIBLE_TOKEN}@gitlab.com/ansible_playbooks7843206/docker.git'
+          version: main
+          name: docker
+          scm: 'git'
+        - src: 'https://oauth2:${ANSIBLE_TOKEN}@gitlab.com/ansible_playbooks7843206/traefik.git'
+          version: main
+          name: traefik
+          scm: 'git'
+      EOF
+
+        ansible-galaxy install -r requirements1.yml -p roles/ --force
+      fi
+
+      echo "Installed roles:"
+      ls -la roles/
+    - rm requirements1.yml
+    - ansible --version
+    - ansible-lint --version
+    - ansible-lint -q --offline
+    - ansible all -i hosts.yml -m ping
+    - |
+      echo "Current directory structure:"
+      ls -la
+
+      echo "Inventory file:"
+      cat hosts.yml
+
+      echo "Running playbook..."
+      ansible-playbook -i hosts.yml playbook.yml --limit all
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
