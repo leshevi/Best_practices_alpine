@@ -1,0 +1,8 @@
+- name: Deploy application
+  hosts: all
+  become: true
+  vars:
+    traefik_ansible_vault_password: "{{ lookup('env', 'ANSIBLE_VAULT_PASSWORD') }}"
+  roles:
+    - docker
+    - traefik
